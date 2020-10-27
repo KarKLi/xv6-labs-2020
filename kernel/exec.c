@@ -75,6 +75,7 @@ exec(char *path, char **argv)
   sp = sz;
   stackbase = sp - PGSIZE;
 
+  // After malloc new , the kernel pagetable should update simultaneously.
   u2kvmcopy(pagetable, p->kpagetable, 0, sz);
 
   // Push argument strings, prepare rest of stack in ustack.
