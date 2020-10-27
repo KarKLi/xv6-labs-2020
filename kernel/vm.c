@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -131,8 +133,8 @@ kvmpa(uint64 va)
   uint64 off = va % PGSIZE;
   pte_t *pte;
   uint64 pa;
-  
-  pte = walk(kernel_pagetable, va, 0);
+  struct proc *p = myproc();
+  pte = walk(p->kpagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
   if((*pte & PTE_V) == 0)
@@ -379,23 +381,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -405,38 +391,112 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
+  return copyinstr_new(pagetable, dst, srcva, max);
+}
 
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
-
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
+// Print three-level PTE of the init process.
+void vmprint(pagetable_t pagetable)
+{
+  static char prefix[100] = {0};
+  static char *p = prefix;
+  if (strlen(prefix) == 0)
+  {
+    printf("page table %p\n", pagetable);
+    memmove(p, "..", strlen(".."));
+    p += strlen("..");
   }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
+  for (int i = 0; i < 512; i++)
+  {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V))
+    {
+      printf("%s%d: pte %p pa %p\n", prefix, i, pte, PTE2PA(pte));
+      uint64 child = PTE2PA(pte);
+      // Set the prefix
+      memmove(p, " ..", strlen(" .."));
+      p += strlen(" ..");
+      if (strlen(prefix) <= 8)
+        vmprint((pagetable_t)child);
+      memset(p - strlen(" .."), 0, strlen(" .."));
+      p -= strlen(" ..");
+    }
+    else
+    {
+      continue;
+    }
+  }
+}
+
+/*
+ * create a direct-map page table for the process kernel page.
+ */
+pagetable_t ukvminit()
+{
+  pagetable_t kpagetable = (pagetable_t)kalloc();
+  if (kpagetable == (pagetable_t)0)
+    return kpagetable;
+  memset(kpagetable, 0, PGSIZE);
+
+  // uart registers
+  ukvmmap(kpagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  // virtio mmio disk interface
+  ukvmmap(kpagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+  // CLINT
+  ukvmmap(kpagetable, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+
+  // PLIC
+  ukvmmap(kpagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+
+  // map kernel text executable and read-only.
+  ukvmmap(kpagetable, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+
+  // map kernel data and the physical RAM we'll make use of.
+  ukvmmap(kpagetable, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  ukvmmap(kpagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  return kpagetable;
+}
+
+// add a mapping to the process kernel page table.
+// does not flush TLB or enable paging.
+void ukvmmap(pagetable_t page, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  if (mappages(page, va, sz, pa, perm) != 0)
+    panic("kvmmap");
+}
+
+// Switch h/w page table register to the kernel's page table,
+// and enable paging.
+void ukvminithart(pagetable_t kpage)
+{
+  w_satp(MAKE_SATP(kpage));
+  sfence_vma();
+}
+
+// Add user mappings to each process's kernel page table
+void u2kvmcopy(pagetable_t pagetable, pagetable_t kpagetable, uint64 oldsz, uint64 newsz)
+{
+  pte_t *pte_from, *pte_to;
+  uint64 i, pa;
+  uint flags;
+  if (newsz < oldsz)
+    return;
+  oldsz = PGROUNDUP(oldsz);
+  for (i = oldsz; i < newsz; i += PGSIZE)
+  {
+    if ((pte_from = walk(pagetable, i, 0)) == 0)
+      panic("u2kvmcopy: pte should exist");
+    if ((pte_to = walk(kpagetable, i, 1)) == 0)
+      panic("u2kvmcopy: walk failed");
+    pa = PTE2PA(*pte_from);
+    // PTE_U cannot be accessed by kernel.
+    flags = (PTE_FLAGS(*pte_from) & (~PTE_U));
+    // Write to process's kernel page table
+    *pte_to = PA2PTE(pa) | flags;
   }
 }
