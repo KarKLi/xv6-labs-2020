@@ -289,6 +289,8 @@ growproc(int n)
     // Prevent user processes from growing larger than the PLIC address.
     if (PGROUNDUP(sz + n) >= PLIC)
       return -1;
+    // After malloc or dealloc of the user virtual memory, the process kernel page table
+    // should be copied.
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
@@ -323,7 +325,7 @@ fork(void)
   }
   np->sz = p->sz;
 
-  // After pagetable map changes, the kernel pagetable should update simultaneously.
+  // After map new page table, the kernel pagetable should update simultaneously.
   u2kvmcopy(np->pagetable, np->kpagetable, 0, np->sz);
 
   np->parent = p;
